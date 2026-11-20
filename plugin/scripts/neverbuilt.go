@@ -686,7 +686,124 @@ func firstLines(s string, err error) string {
 //
 // A file that doesn't parse but whose //go:build line can only be true with
 // an ignore tag, such as a code template, is returned in ignored instead.
+// readGoModIgnoreDirs parses the ignore directives in root/go.mod (Go 1.25+)
+// and returns the directory patterns neverbuilt must skip, because `go list ./...`
+// skips them. go/build has no parser for this directive, so a small line-based
+// reader is enough: it handles both `ignore ./dir` and the block form.
+func readGoModIgnoreDirs(root string) []string {
+	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	inBlock := false
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		// strip trailing comments
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+		}
+		if line == "" {
+			continue
+		}
+		if inBlock {
+			if line == ")" {
+				inBlock = false
+				continue
+			}
+			if strings.HasPrefix(line, ")") {
+				inBlock = false
+				line = strings.TrimSpace(strings.TrimPrefix(line, ")"))
+				if line == "" {
+					continue
+				}
+			}
+			for _, tok := range strings.Fields(line) {
+				tok = strings.TrimPrefix(tok, "./")
+				tok = strings.TrimSuffix(tok, "/")
+				if tok != "" {
+					out = append(out, tok)
+				}
+			}
+			continue
+		}
+		if !strings.HasPrefix(line, "ignore") {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(line, "ignore"))
+		if rest == "" {
+			continue
+		}
+		if strings.HasPrefix(rest, "(") {
+			rest = strings.TrimSpace(strings.TrimPrefix(rest, "("))
+			if rest == ")" || rest == "" {
+				inBlock = true
+				continue
+			}
+			// inline single entry on the same line as the paren
+			if strings.HasSuffix(rest, ")") {
+				rest = strings.TrimSpace(strings.TrimSuffix(rest, ")"))
+				inBlock = false
+			} else {
+				inBlock = true
+			}
+			for _, tok := range strings.Fields(rest) {
+				tok = strings.TrimPrefix(tok, "./")
+				tok = strings.TrimSuffix(tok, "/")
+				if tok != "" && tok != ")" {
+					out = append(out, tok)
+				}
+			}
+			continue
+		}
+		for _, tok := range strings.Fields(rest) {
+			tok = strings.TrimPrefix(tok, "./")
+			tok = strings.TrimSuffix(tok, "/")
+			if tok != "" {
+				out = append(out, tok)
+			}
+		}
+	}
+	// de-duplicate
+	seen := map[string]bool{}
+	var uniq []string
+	for _, p := range out {
+		if !seen[p] {
+			seen[p] = true
+			uniq = append(uniq, p)
+		}
+	}
+	return uniq
+}
+
+func isIgnoredGoModDir(rel string, patterns []string) bool {
+	rel = filepath.ToSlash(rel)
+	if rel == "." || rel == "" {
+		return false
+	}
+	for _, p := range patterns {
+		p = filepath.ToSlash(p)
+		if p == rel {
+			return true
+		}
+		if strings.HasPrefix(rel, p+"/") {
+			return true
+		}
+		if ok, err := filepath.Match(p, rel); err == nil && ok {
+			return true
+		}
+		// match against the final path element too, for bare names
+		if !strings.Contains(p, "/") {
+			if ok, err := filepath.Match(p, filepath.Base(rel)); err == nil && ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func walk(root string, ignore []string) (files []*goFile, ignored []string, err error) {
+	gomodIgnores := readGoModIgnoreDirs(root)
 	var bad []string
 	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -701,6 +818,10 @@ func walk(root string, ignore []string) (files []*goFile, ignored []string, err 
 				return filepath.SkipDir
 			}
 			if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+				return filepath.SkipDir
+			}
+			rel, _ := filepath.Rel(root, path)
+			if isIgnoredGoModDir(rel, gomodIgnores) {
 				return filepath.SkipDir
 			}
 			return nil

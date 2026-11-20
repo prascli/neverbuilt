@@ -5,6 +5,7 @@ package tests
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -725,4 +726,38 @@ func TestIgnoredTemplateIsSkipped(t *testing.T) {
 		"tmpl/x.go": "//go:build linux\n\npackage {{.Pkg}}\n",
 	}))
 	assertUntrusted(t, r, "unparseable file without ignore tag")
+}
+
+func TestGoModIgnoreDirectiveSkipsDir(t *testing.T) {
+	// Go 1.25 added the ignore directive to go.mod; older toolchains reject
+	// the module, so skip on those machines.
+	if !goVersionAtLeast("1.25") {
+		t.Skip("requires Go 1.25 or newer for the go.mod ignore directive")
+	}
+	broken := "package x\n\nfunc F() { undefined() }\n"
+	dir := writeModule(t, map[string]string{
+		"go.mod":            "module example.com/m\n\ngo 1.25\n\nignore ./ignored\n",
+		"a.go":              "package a\n",
+		"ignored/broken.go": broken,
+	})
+	assertClean(t, runTool(t, nil, "--dir", dir))
+}
+
+// goVersionAtLeast reports whether the toolchain running the tests is at least
+// the given Go minor version (e.g. "1.25").
+func goVersionAtLeast(want string) bool {
+	v := strings.TrimPrefix(runtime.Version(), "go")
+	// compare "1.25" style
+	parts := strings.Split(v, ".")
+	wparts := strings.Split(want, ".")
+	for i := 0; i < len(wparts) && i < len(parts); i++ {
+		// numeric compare on leading digits
+		a, b := 0, 0
+		fmt.Sscan(parts[i], &a)
+		fmt.Sscan(wparts[i], &b)
+		if a != b {
+			return a > b
+		}
+	}
+	return len(parts) >= len(wparts)
 }
