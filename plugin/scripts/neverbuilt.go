@@ -679,6 +679,79 @@ func firstLines(s string, err error) string {
 	return strings.Join(lines, "\n")
 }
 
+
+// ignoredDirsFromGoMod reads the ignore directive(s) of the module's go.mod and
+// returns the set of module-relative directories that Go 1.25+ skips for ./...
+// patterns. go/build has no parser for this directive, so a small line-based
+// reader handles both the single-line and parenthesized forms.
+func ignoredDirsFromGoMod(root string) map[string]bool {
+	out := map[string]bool{}
+	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	if err != nil {
+		return out
+	}
+	inBlock := false
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+		}
+		if line == "" {
+			continue
+		}
+		if inBlock {
+			if line == ")" {
+				inBlock = false
+				continue
+			}
+			addIgnoredDir(line, out)
+			continue
+		}
+		if !strings.HasPrefix(line, "ignore") {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(line, "ignore"))
+		if rest == "" {
+			continue
+		}
+		if strings.HasPrefix(rest, "(") {
+			inBlock = true
+			rest = strings.TrimSpace(strings.TrimPrefix(rest, "("))
+			if rest != "" && rest != ")" {
+				addIgnoredDir(rest, out)
+			}
+			continue
+		}
+		for _, p := range strings.Fields(rest) {
+			addIgnoredDir(p, out)
+		}
+	}
+	return out
+}
+
+func addIgnoredDir(p string, out map[string]bool) {
+	p = strings.TrimSpace(p)
+	p = strings.Trim(p, "()")
+	if p == "" || p == ")" {
+		return
+	}
+	p = strings.TrimPrefix(p, "./")
+	p = strings.TrimSuffix(p, "/")
+	if p == "" || p == "." {
+		return
+	}
+	out[p] = true
+}
+
+func isIgnoredDir(rel string, ignored map[string]bool) bool {
+	for p := range ignored {
+		if rel == p || strings.HasPrefix(rel, p+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // walk finds the .go files that `go list ./...` could match: it skips
 // testdata, vendor, directories and files starting with . or _, and nested
 // modules. Every file is parsed in full; any that doesn't parse makes the
@@ -687,6 +760,7 @@ func firstLines(s string, err error) string {
 // A file that doesn't parse but whose //go:build line can only be true with
 // an ignore tag, such as a code template, is returned in ignored instead.
 func walk(root string, ignore []string) (files []*goFile, ignored []string, err error) {
+	ignoredDirs := ignoredDirsFromGoMod(root)
 	var bad []string
 	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -696,6 +770,10 @@ func walk(root string, ignore []string) (files []*goFile, ignored []string, err 
 		if d.IsDir() {
 			if path == root {
 				return nil
+			}
+			rel, rerr := filepath.Rel(root, path)
+			if rerr == nil && isIgnoredDir(filepath.ToSlash(rel), ignoredDirs) {
+				return filepath.SkipDir
 			}
 			if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") || name == "testdata" || name == "vendor" {
 				return filepath.SkipDir

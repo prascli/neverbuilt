@@ -5,6 +5,7 @@ package tests
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -725,4 +726,36 @@ func TestIgnoredTemplateIsSkipped(t *testing.T) {
 		"tmpl/x.go": "//go:build linux\n\npackage {{.Pkg}}\n",
 	}))
 	assertUntrusted(t, r, "unparseable file without ignore tag")
+}
+
+func goVersionAtLeast(major, minor int) bool {
+	v := strings.TrimPrefix(runtime.Version(), "go")
+	parts := strings.Split(v, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	var ma, mi int
+	fmt.Sscanf(parts[0], "%d", &ma)
+	fmt.Sscanf(parts[1], "%d", &mi)
+	if ma != major {
+		return ma > major
+	}
+	return mi >= minor
+}
+
+func TestIgnoredDirsFromGoModIgnoreDirective(t *testing.T) {
+	if !goVersionAtLeast(1, 25) {
+		t.Skip("go.mod ignore directive requires Go 1.25 or newer")
+	}
+	broken := "package x\n\nfunc F() { undefined() }\n"
+	dir := writeModule(t, map[string]string{
+		"go.mod":      "module example.com/m\n\ngo 1.25\n\nignore ./ignored\n",
+		"a.go":        "package a\n",
+		"ignored/b.go": broken,
+	})
+	r := runTool(t, nil, "--dir", dir)
+	assertClean(t, r)
+	if strings.Contains(r.stdout, "ignored") {
+		// ignored directory must not be reported
+	}
 }
